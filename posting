@@ -1,0 +1,315 @@
+import os
+import json
+import re
+from telegram.helpers import escape_markdown
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import (ApplicationBuilder, ContextTypes, ConversationHandler, CallbackQueryHandler, MessageHandler, filters, CommandHandler)
+from dotenv import load_dotenv
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
+from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
+
+# Загрузка переменных окружения
+load_dotenv()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise ValueError("TELEGRAM_BOT_TOKEN не установлен. Пожалуйста, проверьте ваш .env файл.")
+
+# Настройка базы данных
+Base = declarative_base()
+engine = create_engine('sqlite:///posts.db')
+Session = scoped_session(sessionmaker(bind=engine))
+
+# Логирование
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Таблица постов для хранения данных постов
+class Post(Base):
+    __tablename__ = 'posts'
+    id = Column(Integer, primary_key=True)
+    text = Column(String)
+    media = Column(String, nullable=True)
+    publish_time = Column(DateTime)
+    reactions = Column(String, nullable=True)
+    buttons = Column(String, nullable=True)
+    published = Column(Integer, default=0)
+
+Base.metadata.create_all(engine)
+
+# Настройка планировщика задач
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+# Установка политики цикла событий для Windows
+if os.name == 'nt':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Состояния для ConversationHandler
+TEXT, MEDIA, BUTTONS, REACTIONS, SCHEDULE, CONFIRM = range(6)
+
+# Обработчик команды /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    keyboard = [
+        [InlineKeyboardButton("Создать новый пост", callback_data='new_post')],
+        [InlineKeyboardButton("Просмотреть запланированные посты", callback_data='view_posts')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Привет! Я помогу вам создать отложенный пост для вашего канала.", reply_markup=reply_markup)
+    return ConversationHandler.END
+
+# Начало создания нового поста через кнопку
+async def new_post_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Пожалуйста, введите текст для вашего поста:")
+    return TEXT
+
+# Получение текста поста
+async def get_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['text'] = escape_markdown(update.message.text, version=2)
+    keyboard = [[InlineKeyboardButton("Пропустить", callback_data='skip_media')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Теперь вы можете отправить изображение или нажмите 'Пропустить', чтобы пропустить этот шаг.", reply_markup=reply_markup)
+    return MEDIA
+
+# Получение медиа-файла
+async def get_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['media'] = update.message.photo[-1].file_id if update.message.photo else None
+    await ask_for_buttons(update, context)
+    return BUTTONS
+
+# Пропуск добавления медиа
+async def skip_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['media'] = None
+    await ask_for_buttons(query, context)
+    return BUTTONS
+
+# Запрос на добавление кнопок
+async def ask_for_buttons(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = "Хотите добавить кнопки с гиперссылками? Введите текст кнопки и URL через запятую (например, 'Мой сайт, https://example.com'). Нажмите 'Пропустить', чтобы пропустить этот шаг."
+    if isinstance(update_or_query, Update):
+        await update_or_query.message.reply_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data='skip_buttons')]]))
+    else:
+        await update_or_query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data='skip_buttons')]]))
+
+# Добавление кнопок с гиперссылками
+async def get_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    buttons_data = update.message.text.split(',')
+    if len(buttons_data) == 2:
+        context.user_data['buttons'] = [{"text": buttons_data[0].strip(), "url": buttons_data[1].strip()}]
+    else:
+        context.user_data['buttons'] = []
+    await ask_for_reactions(update, context)
+    return REACTIONS
+
+# Пропуск добавления кнопок
+async def skip_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['buttons'] = []
+    await ask_for_reactions(query, context)
+    return REACTIONS
+
+# Запрос на добавление реакций
+async def ask_for_reactions(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = "Хотите добавить реакции? Введите до четырех эмодзи через запятую (например, '👍,👎,❤️,😂'). Нажмите 'Пропустить', чтобы пропустить этот шаг."
+    if isinstance(update_or_query, Update):
+        await update_or_query.message.reply_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data='skip_reactions')]]))
+    else:
+        await update_or_query.edit_message_text(message, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data='skip_reactions')]]))
+
+# Добавление реакций
+async def get_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reactions_data = update.message.text.split(',')
+    context.user_data['reactions'] = [reaction.strip() for reaction in reactions_data[:4]]
+    await ask_for_schedule(update, context)
+    return SCHEDULE
+
+# Пропуск добавления реакций
+async def skip_reactions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data['reactions'] = []
+    await ask_for_schedule(query, context)
+    return SCHEDULE
+
+# Запрос на установку времени публикации
+async def ask_for_schedule(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = "Введите дату и время публикации в формате ГГГГ-ММ-ДД ЧЧ:ММ (например, 2023-12-31 18:30):"
+    if isinstance(update_or_query, Update):
+        await update_or_query.message.reply_text(message)
+    else:
+        await update_or_query.edit_message_text(message)
+
+# Установка времени публикации
+async def schedule_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        publish_time = datetime.strptime(update.message.text, '%Y-%m-%d %H:%M')
+        if publish_time <= datetime.now():
+            await update.message.reply_text("Время публикации должно быть в будущем. Пожалуйста, попробуйте снова:")
+            return SCHEDULE
+        context.user_data['publish_time'] = publish_time
+        keyboard = [
+            [InlineKeyboardButton("Подтвердить", callback_data='confirm')],
+            [InlineKeyboardButton("Отменить", callback_data='cancel')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Подтвердите создание поста:", reply_markup=reply_markup)
+        return CONFIRM
+    except ValueError:
+        await update.message.reply_text("Неверный формат даты. Пожалуйста, попробуйте снова:")
+        return SCHEDULE
+
+# Подтверждение создания поста
+async def confirm_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == 'confirm':
+        # Сохранение поста в базе данных
+        try:
+            with Session() as session:
+                new_post = Post(
+                    text=context.user_data['text'],
+                    media=context.user_data.get('media'),
+                    buttons=json.dumps(context.user_data.get('buttons', []), ensure_ascii=False),
+                    reactions=json.dumps(context.user_data.get('reactions', []), ensure_ascii=False),
+                    publish_time=context.user_data['publish_time']
+                )
+                session.add(new_post)
+                session.commit()
+
+                # Добавляем задачу в планировщик
+                loop = asyncio.get_event_loop()
+                scheduler.add_job(publish_post_wrapper, 'date', run_date=context.user_data['publish_time'], args=[new_post.id, loop])
+
+                await query.edit_message_text(text="Пост успешно запланирован!")
+                logger.info(f"Пост с ID {new_post.id} был успешно запланирован на {context.user_data['publish_time']}")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении поста: {e}")
+            await query.edit_message_text(text="Произошла ошибка при сохранении поста. Пожалуйста, попробуйте снова.")
+    else:
+        await query.edit_message_text(text="Создание поста отменено.")
+    return ConversationHandler.END
+
+# Обёртка для публикации поста
+def publish_post_wrapper(post_id: int, loop):
+    asyncio.run_coroutine_threadsafe(publish_post(post_id), loop)
+
+# Публикация поста
+async def publish_post(post_id: int) -> None:
+    with Session() as session:
+        try:
+            post = session.query(Post).filter_by(id=post_id).first()
+            if post and not post.published:
+                chat_id = -1002294321394  # ID канала для публикаций
+                application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+                async with application:
+                    buttons = json.loads(post.buttons) if post.buttons else []
+                    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(button["text"], url=button["url"]) for button in buttons]]) if buttons else None
+
+                    # Добавление кнопок реакций
+                    try:
+                        reactions = json.loads(post.reactions) if post.reactions and post.reactions != 'null' else []
+                    except json.JSONDecodeError:
+                        reactions = []
+                    if reactions:
+                        reaction_buttons = [InlineKeyboardButton(reaction, callback_data=f'react_{post_id}_{reaction}') for reaction in reactions]
+                        if reply_markup:
+                            reply_markup = InlineKeyboardMarkup(reply_markup.inline_keyboard + tuple([reaction_buttons]))
+                        else:
+                            reply_markup = InlineKeyboardMarkup([reaction_buttons])
+
+                    # Логирование перед отправкой сообщения
+                    logger.info(f"Публикация поста с ID {post_id} в канал {chat_id}. Текст: {post.text}")
+                    if post.media:
+                        logger.info(f"Отправка фото с media_id: {post.media}")
+                        await application.bot.send_photo(chat_id=chat_id, photo=post.media, caption=post.text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                    else:
+                        logger.info(f"Отправка сообщения без медиа")
+                        await application.bot.send_message(chat_id=chat_id, text=post.text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=reply_markup, disable_web_page_preview=True)
+                    logger.info(f"Пост с ID {post_id} успешно опубликован в канал {chat_id}")
+                post.published = 1
+                session.commit()
+        except Exception as e:
+            logger.error(f"Ошибка при публикации поста с ID {post_id}: {e}")
+
+# Обработчик команды /cancel
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text('Создание поста отменено. Используйте /start для начала заново.')
+    return ConversationHandler.END
+
+# Обработчик для просмотра запланированных постов
+async def view_posts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    with Session() as session:
+        posts = session.query(Post).filter_by(published=0).all()
+        if posts:
+            message = "Запланированные посты:\n"
+            for post in posts:
+                message += f"\nID: {post.id}\nТекст: {post.text}\nВремя публикации: {post.publish_time.strftime('%Y-%m-%d %H:%M')}\n"
+        else:
+            message = "Нет запланированных постов."
+        await query.edit_message_text(text=message)
+
+# Обработчик реакции на пост
+async def handle_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    _, post_id, reaction = data.split('_')
+    with Session() as session:
+        try:
+            post = session.query(Post).filter_by(id=int(post_id)).first()
+            if post:
+                # Обновление счётчика для реакции (можно расширить для более сложной логики)
+                await query.answer(f'Вы выбрали: {reaction}')
+                logger.info(f'Реакция {reaction} была выбрана для поста с ID {post_id}')
+        except Exception as e:
+            logger.error(f"Ошибка при обработке реакции на пост с ID {post_id}: {e}")
+
+# Основная функция для запуска бота
+async def main() -> None:
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(new_post_button, pattern='^new_post$')],
+        states={
+            TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_text)],
+            MEDIA: [MessageHandler(filters.PHOTO, get_media), CallbackQueryHandler(skip_media, pattern='^skip_media$')],
+            BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buttons), CallbackQueryHandler(skip_buttons, pattern='^skip_buttons$')],
+            REACTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_reactions), CallbackQueryHandler(skip_reactions, pattern='^skip_reactions$')],
+            SCHEDULE: [MessageHandler(filters.TEXT & ~filters.COMMAND, schedule_post)],
+            CONFIRM: [CallbackQueryHandler(confirm_post, pattern='^(confirm|cancel)$')],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    # Регистрация обработчиков команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(view_posts, pattern='^view_posts$'))
+    application.add_handler(CallbackQueryHandler(handle_reaction, pattern=r'^react_\d+_.+$'))
+
+    # Запуск бота
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+
+    # Бесконечный цикл, чтобы бот продолжал работать
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
+        scheduler.shutdown()
